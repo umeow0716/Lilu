@@ -457,8 +457,8 @@ kern_return_t MachInfo::readMachHeader(uint8_t *buffer, vnode_t vnode, vfs_conte
 						}
 					}
 
-					Buffer::deleter(compressedBuf);
-				} else {
+						if (compressedBuf) Buffer::deleter(compressedBuf);
+					} else {
 					SYSLOG("mach", "decompression disallowed due to lowmem flag");
 				}
 				return KERN_FAILURE;

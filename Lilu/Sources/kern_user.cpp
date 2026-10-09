@@ -390,6 +390,10 @@ void UserPatcher::patchBinary(vm_map_t map, const char *path, uint32_t len) {
 }
 
 bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
+#if !defined(__x86_64__)
+	(void)map; (void)slide;
+	return false;
+#else
 	if (!map || !orgGetTaskMap || map != orgGetTaskMap(current_task())) {
 		SYSLOG("user", "Tahoe local patch requires the admitted process's own execution context");
 		return false;
@@ -477,6 +481,7 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 	Buffer::deleter(scratch);
 	Buffer::deleter(actions);
 	return valid;
+#endif
 }
 
 bool UserPatcher::getTaskHeader(vm_map_t taskPort, mach_header_64 &header) {
@@ -1050,14 +1055,18 @@ bool UserPatcher::loadFilesForPatching() {
 			venturaSharedCacheHaswell : venturaSharedCacheLegacy, binaryMod[i]->path, fileSize, cacheTextStart, &cacheBase, cacheUUID) :
 			FileIO::readFileToBuffer(binaryMod[i]->path, fileSize);
 		if (strictTahoe && buf) {
+			if (cacheTextStart > static_cast<uint64_t>(~static_cast<vm_address_t>(0))-fileSize) {
+				Buffer::deleter(buf);
+				return false;
+			}
 			if (tahoeCacheBase && (tahoeCacheBase != cacheBase || memcmp(tahoeCacheUUID, cacheUUID, 16))) {
 				Buffer::deleter(buf);
 				return false;
 			}
 			tahoeCacheBase = cacheBase;
 			memcpy(tahoeCacheUUID, cacheUUID, 16);
-			binaryMod[i]->startTEXT = cacheTextStart;
-			binaryMod[i]->endTEXT = cacheTextStart+fileSize;
+			binaryMod[i]->startTEXT = static_cast<vm_address_t>(cacheTextStart);
+			binaryMod[i]->endTEXT = static_cast<vm_address_t>(cacheTextStart+fileSize);
 		}
 		if (buf) {
 			vm_address_t vmsegment {0};

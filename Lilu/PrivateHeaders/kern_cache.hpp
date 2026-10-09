@@ -150,10 +150,12 @@ inline uint8_t *readText(const char *cachePath, const char *imagePath, size_t &s
 		offset += lc->cmdsize;
 	}
 	valid = valid && textSize && offset == mh.sizeofcmds;
-	auto result = valid ? Buffer::create<uint8_t>(textSize) : nullptr;
-	if (result && readVM(main, cachePath, imageAddress, result, textSize)) {
+	// The validated 16 MiB ceiling also fits the retained i386 build.
+	auto boundedSize = static_cast<size_t>(textSize);
+	auto result = valid ? Buffer::create<uint8_t>(boundedSize) : nullptr;
+	if (result && readVM(main, cachePath, imageAddress, result, boundedSize)) {
 		memcpy(result+sizeof(mh), commands, mh.sizeofcmds);
-		size = textSize; start = imageAddress;
+		size = boundedSize; start = imageAddress;
 		if (cacheBase) *cacheBase = headerAddress;
 		if (cacheUUID) memcpy(cacheUUID, main.header.uuid, 16);
 	} else if (result) { Buffer::deleter(result); result = nullptr; }
