@@ -12,6 +12,7 @@
 #include <Headers/kern_patcher.hpp>
 
 #include <mach/shared_region.h>
+#include <mach/vm_region.h>
 #include <sys/kauth.h>
 
 class UserPatcher {
@@ -260,6 +261,8 @@ private:
 	using t_getMapMin = vm_map_offset_t (*)(vm_map_t);
 	using t_vmMapSwitchProtect = void (*)(vm_map_t, boolean_t);
 	using t_vmMapCheckProtection = boolean_t (*)(vm_map_t, vm_map_offset_t, vm_map_offset_t, vm_prot_t);
+	using t_vmMapRegionRecurse64 = kern_return_t (*)(vm_map_t, vm_map_offset_t *, vm_map_size_t *, natural_t *, vm_region_submap_info_64_t, mach_msg_type_number_t *);
+	t_vmMapRegionRecurse64 orgVmMapRegionRecurse64 {nullptr};
 	using t_vmMapReadUser = kern_return_t (*)(vm_map_t, vm_map_address_t, const void *, vm_size_t);
 	using t_vmMapWriteUser = kern_return_t (*)(vm_map_t, const void *, vm_map_address_t, vm_size_t);
 	using t_csAllowInvalid = int (*)(proc_t);

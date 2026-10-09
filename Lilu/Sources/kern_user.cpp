@@ -447,6 +447,7 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 					SYSLOG("user", "Tahoe local patch target preflight failed at %llX protection=%X read=%X matches=%d site=%lu size=%lu", address, protection, readResult, matches, ref->i, patch.size);
 					valid = false; break;
 				}
+				if (!count) SYSLOG("user", "Tahoe exact local patch leaf admitted protection=%X read=%X matches=%d", protection, readResult, matches);
 				actions[count++] = {address, &patch, protection};
 			}
 		}
@@ -1295,6 +1296,23 @@ bool UserPatcher::loadLookups() {
 }
 
 vm_prot_t UserPatcher::getPageProtection(vm_map_t map, vm_map_address_t addr) {
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		// The task's shared-region parent is r--. Query the native leaf,
+		// not vm_map_check_protection's enclosing submap entry.
+		if (!orgVmMapRegionRecurse64 || addr > UINT64_MAX-PAGE_SIZE) return VM_PROT_NONE;
+		vm_map_offset_t region = addr;
+		vm_map_size_t size = 0;
+		natural_t depth = 32;
+		vm_region_submap_info_data_64_t info {};
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		auto result = orgVmMapRegionRecurse64(map, &region, &size, &depth, &info, &count);
+		if (result || count < VM_REGION_SUBMAP_INFO_V0_COUNT_64 || info.is_submap ||
+		    region > addr || size < PAGE_SIZE || addr-region > size-PAGE_SIZE) {
+			SYSLOG("user", "Tahoe leaf protection query refused result=%X depth=%u submap=%u", result, depth, info.is_submap);
+			return VM_PROT_NONE;
+		}
+		return info.protection;
+	}
 	vm_prot_t prot = VM_PROT_NONE;
 	if (orgVmMapCheckProtection(map, addr, addr+PAGE_SIZE, VM_PROT_READ))
 		prot |= VM_PROT_READ;
@@ -1308,6 +1326,12 @@ vm_prot_t UserPatcher::getPageProtection(vm_map_t map, vm_map_address_t addr) {
 
 bool UserPatcher::hookMemoryAccess() {
 	if (getKernelVersion() == KernelVersion::Tahoe) {
+		orgVmMapRegionRecurse64 = reinterpret_cast<t_vmMapRegionRecurse64>(patcher->solveSymbol(KernelPatcher::KernelID, "_vm_map_region_recurse_64"));
+		if (patcher->getError() != KernelPatcher::Error::NoError || !orgVmMapRegionRecurse64) {
+			patcher->clearError();
+			SYSLOG("user", "Tahoe native leaf protection query is unavailable");
+			return false;
+		}
 		orgCsAllowInvalid = reinterpret_cast<t_csAllowInvalid>(patcher->solveSymbol(KernelPatcher::KernelID, "_cs_allow_invalid"));
 		if (patcher->getError() != KernelPatcher::Error::NoError || !orgCsAllowInvalid) {
 			patcher->clearError();
