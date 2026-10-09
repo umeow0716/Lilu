@@ -21,6 +21,7 @@ class Configuration {
 	 */
 	static constexpr const char *bootargOff {"-liluoff"};           // Disable the kext
 	static constexpr const char *bootargUserOff {"-liluuseroff"};   // Disable kext user patcher
+	static constexpr const char *bootargTahoeUser {"-lilutahoeuser"}; // Opt in to exact-process local patches on Tahoe x86_64
 	static constexpr const char *bootargBeta {"-lilubeta"};         // Force enable the kext on unsupported os
 	static constexpr const char *bootargBetaAll {"-lilubetaall"};   // Force enable the kext and all plugins on unsupported os
 	static constexpr const char *bootargForce {"-liluforce"};       // Force enable the kext (including single user mode)

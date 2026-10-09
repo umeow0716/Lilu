@@ -12,6 +12,7 @@
 #include <Headers/kern_file.hpp>
 #include <Headers/kern_devinfo.hpp>
 #include <PrivateHeaders/kern_config.hpp>
+#include <PrivateHeaders/kern_cache.hpp>
 
 #include <mach/vm_map.h>
 #include <mach-o/fat.h>
@@ -27,6 +28,15 @@ struct procref {
 };
 
 kern_return_t UserPatcher::vmProtect(vm_map_t map, vm_offset_t start, vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) {
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		// Ask the native MAC policy; never guess or overwrite struct proc fields.
+		if ((new_protection & (VM_PROT_EXECUTE | VM_PROT_WRITE)) == (VM_PROT_EXECUTE | VM_PROT_WRITE) &&
+		    (!that->orgCsAllowInvalid || !that->orgCsAllowInvalid(current_proc()))) {
+			SYSLOG("user", "Tahoe native policy refused local code modification");
+			return KERN_PROTECTION_FAILURE;
+		}
+		return vm_protect(map, start, size, set_maximum, new_protection);
+	}
 	// On 10.14 XNU attempted to fix broken W^X and introduced several changes:
 	// 1. vm_protect (vm_map_protect) got a call to cs_process_enforcement (formerly cs_enforcement), which aborts
 	//    with a KERN_PROTECTION_FAILURE abort on failure. So far global codesign enforcement is not enabled,
@@ -113,6 +123,14 @@ bool UserPatcher::init(KernelPatcher &kernelPatcher, bool preferSlowMode) {
 	patcher = &kernelPatcher;
 
 	pending.init();
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		if (preferSlowMode) {
+			SYSLOG("user", "Tahoe refuses the legacy slow/restrict mode");
+			return false;
+		}
+		tahoeCacheLock = IOLockAlloc();
+		return tahoeCacheLock != nullptr;
+	}
 
 	listener = kauth_listen_scope(KAUTH_SCOPE_FILEOP, execListener, &cookie);
 
@@ -128,6 +146,24 @@ bool UserPatcher::registerPatches(ProcInfo **procs, size_t procNum, BinaryModInf
 	// Silently return if disabled
 	if (ADDPR(config).isUserDisabled)
 		return true;
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		for (size_t i = 0; i < procNum; i++) {
+			if (!procs[i]->path || procs[i]->path[0] != '/' ||
+			    procs[i]->len != strlen(procs[i]->path) ||
+			    (procs[i]->flags & ProcInfo::MatchMask) != ProcInfo::MatchExact) {
+				SYSLOG("user", "Tahoe requires an exact absolute process path");
+				return false;
+			}
+		}
+		for (size_t i = 0; i < modNum; i++) {
+			for (size_t j = 0; j < mods[i]->count; j++) {
+				if (!(mods[i]->patches[j].flags & LocalOnly)) {
+					SYSLOG("user", "Tahoe refuses global binary patches");
+					return false;
+				}
+			}
+		}
+	}
 
 	procInfo = procs;
 	procInfoSize = procNum;
@@ -144,6 +180,10 @@ bool UserPatcher::registerPatches(ProcInfo **procs, size_t procNum, BinaryModInf
 		}
 	}
 
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		// Cryptex availability is not assumed during early plugin registration.
+		return tahoeCacheLock && hookMemoryAccess();
+	}
 	return loadFilesForPatching() && (!patchDyldSharedCache || loadDyldSharedCacheMapping()) && loadLookups() && hookMemoryAccess();
 }
 
@@ -155,6 +195,10 @@ void UserPatcher::deinit() {
 	if (listener) {
 		kauth_unlisten_scope(listener);
 		listener = nullptr;
+	}
+	if (tahoeCacheLock) {
+		IOLockFree(tahoeCacheLock);
+		tahoeCacheLock = nullptr;
 	}
 
 	pending.deinit();
@@ -274,6 +318,9 @@ boolean_t UserPatcher::codeSignValidateRangeWrapper(void *blobs, memory_object_t
 }
 
 void UserPatcher::onPath(const char *path, uint32_t len) {
+	// Tahoe admission is repeated from the current executable vnode after
+	// dyld has inserted its shared region, not from a spawning parent's QoS.
+	if (getKernelVersion() == KernelVersion::Tahoe) return;
 	if (len >= currentMinProcLength) {
 		for (uint32_t i = 0; i < procInfoSize; i++) {
 			auto p = procInfo[i];
@@ -322,13 +369,114 @@ void UserPatcher::onPath(const char *path, uint32_t len) {
 }
 
 void UserPatcher::patchBinary(vm_map_t map, const char *path, uint32_t len) {
+	if (getKernelVersion() == KernelVersion::Tahoe && (!patchDyldSharedCache || !sharedCacheSlideStored)) {
+		SYSLOG("user", "Tahoe local patch skipped: shared-cache mapping is unavailable for %s", path);
+		return;
+	}
 	if (patchDyldSharedCache && sharedCacheSlideStored) {
-		patchSharedCache(map, storedSharedCacheSlide, CPU_TYPE_X86_64);
+		if (getKernelVersion() == KernelVersion::Tahoe) {
+			if (!patchSharedCacheTahoe(map, storedSharedCacheSlide)) {
+				SYSLOG("user", "Tahoe local patch did not complete for %s", path);
+				return;
+			}
+		} else {
+			patchSharedCache(map, storedSharedCacheSlide, CPU_TYPE_X86_64);
+		}
 	} else {
 		if (patchDyldSharedCache) SYSLOG("user", "no slide present, initialisation failed, fallback to restrict");
 		injectRestrict(map);
 	}
-	userCallback.first(userCallback.second, *this, map, path, len);
+	if (userCallback.first) userCallback.first(userCallback.second, *this, map, path, len);
+}
+
+bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
+	if (!map || !orgGetTaskMap || map != orgGetTaskMap(current_task())) {
+		SYSLOG("user", "Tahoe local patch requires the admitted process's own execution context");
+		return false;
+	}
+	struct Action { uint64_t address; const BinaryModPatch *patch; vm_prot_t protection; };
+	constexpr size_t MaxActions = 128;
+	auto actions = Buffer::create<Action>(MaxActions);
+	auto scratch = Buffer::create<uint8_t>(PAGE_SIZE);
+	if (!actions || !scratch) {
+		if (actions) Buffer::deleter(actions);
+		if (scratch) Buffer::deleter(scratch);
+		return false;
+	}
+	bool valid = true;
+	size_t count = 0;
+	size_t expected = 0;
+	for (size_t i = 0; i < binaryModSize; i++) {
+		for (size_t j = 0; j < binaryMod[i]->count; j++) {
+			auto &patch = binaryMod[i]->patches[j];
+			if (patch.section == ProcInfo::SectionDisabled) continue;
+			if (patch.count > MaxActions-expected) { valid = false; break; }
+			expected += patch.count;
+		}
+		if (!valid) break;
+	}
+	// Validate every target before modifying any page. A wrong/stale slide
+	// or a target map that has not entered its cache is an explicit failure.
+	for (size_t i = 0; valid && i < lookupStorage.size(); i++) {
+		auto storage = lookupStorage[i];
+		for (size_t j = 0; valid && j < storage->refs.size(); j++) {
+			auto ref = storage->refs[j];
+			auto &patch = storage->mod->patches[ref->i];
+			if (patch.cpu != CPU_TYPE_X86_64 || !(patch.flags & LocalOnly) ||
+			    !patch.find || !patch.replace || !patch.size || patch.size > PAGE_SIZE) { valid = false; break; }
+			for (size_t k = 0; valid && k < ref->segOffs.size(); k++) {
+				auto start = storage->mod->startTEXT;
+				auto end = storage->mod->endTEXT;
+				auto offset = ref->segOffs[k];
+				if (!start || end <= start || offset < 0 || uint64_t(offset) > end-start ||
+				    patch.size > end-start-uint64_t(offset) || end > UINT64_MAX-slide || count == MaxActions) { valid = false; break; }
+				auto address = start+uint64_t(offset)+slide;
+				if (patch.size > PAGE_SIZE-(address & (PAGE_SIZE-1))) { valid = false; break; }
+				for (size_t n = 0; n < count; n++) {
+					if (address < actions[n].address+actions[n].patch->size && actions[n].address < address+patch.size) valid = false;
+				}
+				if (!valid) break;
+				auto protection = getPageProtection(map, address & -PAGE_SIZE);
+				if (protection != (VM_PROT_READ|VM_PROT_EXECUTE) ||
+				    orgVmMapReadUser(map, address, scratch, patch.size) || memcmp(scratch, patch.find, patch.size)) {
+					SYSLOG("user", "Tahoe local patch target preflight failed at %llX", address);
+					valid = false; break;
+				}
+				actions[count++] = {address, &patch, protection};
+			}
+		}
+	}
+	valid = valid && count && count == expected;
+	size_t touched = 0;
+	for (size_t i = 0; valid && i < count; i++) {
+		auto &action = actions[i];
+		auto page = action.address & -PAGE_SIZE;
+		// VM_PROT_COPY requests private COW; never write global cache pages.
+		if (vmProtect(map, page, PAGE_SIZE, FALSE, action.protection|VM_PROT_WRITE|VM_PROT_COPY)) { valid = false; break; }
+		touched = i+1;
+		auto write = orgVmMapWriteUser(map, action.patch->replace, action.address, action.patch->size);
+		auto read = orgVmMapReadUser(map, action.address, scratch, action.patch->size);
+		auto restore = vmProtect(map, page, PAGE_SIZE, FALSE, action.protection);
+		valid = !write && !read && !restore && !memcmp(scratch, action.patch->replace, action.patch->size);
+	}
+	if (!valid) {
+		bool rollback = true;
+		while (touched) {
+			auto &action = actions[--touched];
+			auto page = action.address & -PAGE_SIZE;
+			if (vmProtect(map, page, PAGE_SIZE, FALSE, action.protection|VM_PROT_WRITE|VM_PROT_COPY)) { rollback = false; continue; }
+			auto write = orgVmMapWriteUser(map, action.patch->find, action.address, action.patch->size);
+			auto read = orgVmMapReadUser(map, action.address, scratch, action.patch->size);
+			auto restore = vmProtect(map, page, PAGE_SIZE, FALSE, action.protection);
+			if (write || read || restore || memcmp(scratch, action.patch->find, action.patch->size)) rollback = false;
+		}
+		SYSLOG("user", "Tahoe local patch transaction failed rollback=%d", rollback);
+	} else {
+		SYSLOG("user", "Tahoe local patch transaction verified sites=%lu", count);
+	}
+	Buffer::deleter(scratch);
+	Buffer::deleter(actions);
+	return valid;
 }
 
 bool UserPatcher::getTaskHeader(vm_map_t taskPort, mach_header_64 &header) {
@@ -611,6 +759,51 @@ int UserPatcher::vmSharedRegionSlideMojave(uint32_t slide, mach_vm_offset_t entr
 	return FunctionCast(vmSharedRegionSlideMojave, that->orgVmSharedRegionSlideMojave)(slide, entry_start_address, entry_size, slide_start, slide_size, slid_mapping, sr_file_control);
 }
 
+int UserPatcher::sharedRegionCheckTahoe(proc_t process, TahoeCheckArguments *args, int *retval) {
+	// Preserve native syscall ABI, result, copyout and task-map setup exactly.
+	auto result = FunctionCast(sharedRegionCheckTahoe, that->orgSharedRegionCheckTahoe)(process, args, retval);
+	if (result || !args || !args->startAddress || process != current_proc() ||
+	    !atomic_load_explicit(&that->activated, memory_order_relaxed)) return result;
+	auto vnode = that->orgProcExecutableVnode(process);
+	if (!vnode) return result;
+	char path[MAXPATHLEN] {};
+	int capacity = sizeof(path);
+	auto pathError = vn_getpath(vnode, path, &capacity);
+	vnode_put(vnode); // proc_getexecutablevnode returns an iocount, not a usecount.
+	if (pathError || !memchr(path, 0, sizeof(path))) return result;
+	auto length = strlen(path);
+	bool admitted = false;
+	for (size_t i = 0; i < that->procInfoSize; i++) {
+		auto proc = that->procInfo[i];
+		if (length == proc->len && !memcmp(path, proc->path, length+1)) { admitted = true; break; }
+	}
+	if (!admitted) return result;
+	IOLockLock(that->tahoeCacheLock);
+	if (!that->tahoeCacheAttempted) {
+		that->tahoeCacheAttempted = true;
+		that->tahoeCacheLoaded = that->loadFilesForPatching() && that->loadDyldSharedCacheMapping();
+		SYSLOG("user", "Tahoe deferred bounded cache sources ready=%d", that->tahoeCacheLoaded);
+	}
+	auto ready = that->tahoeCacheLoaded;
+	IOLockUnlock(that->tahoeCacheLock);
+	if (!ready) return result;
+	auto map = that->orgGetTaskMap(current_task());
+	uint64_t mappedBase = 0;
+	TahoeCache::Header header {};
+	if (!map || that->orgVmMapReadUser(map, args->startAddress, &mappedBase, sizeof(mappedBase)) ||
+	    mappedBase < that->tahoeCacheBase || mappedBase-that->tahoeCacheBase > UINT32_MAX ||
+	    that->orgVmMapReadUser(map, mappedBase, &header, sizeof(header)) ||
+	    memcmp(header.magic, "dyld_v1", 7) || memcmp(header.uuid, that->tahoeCacheUUID, 16)) {
+		SYSLOG("user", "Tahoe admitted process cache identity unavailable path=%s", path);
+		return result;
+	}
+	auto slide = static_cast<uint32_t>(mappedBase-that->tahoeCacheBase);
+	SYSLOG("user", "Tahoe admitted current-process shared cache path=%s slide=%X", path, slide);
+	if (that->patchSharedCacheTahoe(map, slide) && that->userCallback.first)
+		that->userCallback.first(that->userCallback.second, *that, map, path, length);
+	return result;
+}
+
 void UserPatcher::taskSetMainThreadQos(task_t task, thread_t main_thread) {
 	FunctionCast(taskSetMainThreadQos, that->orgTaskSetMainThreadQos)(task, main_thread);
 
@@ -754,6 +947,15 @@ bool UserPatcher::loadDyldSharedCacheMapping() {
 
 	if (binaryModSize == 0)
 		return true;
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		// The bounded cache reader supplied canonical __TEXT VM ranges.
+		// Tahoe must not fall through to the legacy textual .map parser.
+		for (size_t i = 0; i < binaryModSize; i++) {
+			if (!binaryMod[i]->startTEXT || binaryMod[i]->endTEXT <= binaryMod[i]->startTEXT)
+				return false;
+		}
+		return true;
+	}
 
 	uint8_t *buffer {nullptr};
 	size_t bufferSize {0};
@@ -768,6 +970,10 @@ bool UserPatcher::loadDyldSharedCacheMapping() {
 		buffer = FileIO::readFileToBuffer(SharedCacheMapHaswell, bufferSize);
 	}
 
+	if (!buffer && getKernelVersion() == KernelVersion::Tahoe) {
+		SYSLOG("user", "Tahoe shared-cache map unavailable; refusing legacy restrict fallback");
+		return false;
+	}
 	if (!buffer)
 		buffer = FileIO::readFileToBuffer(SharedCacheMapLegacy, bufferSize);
 
@@ -816,6 +1022,8 @@ bool UserPatcher::loadDyldSharedCacheMapping() {
 
 bool UserPatcher::loadFilesForPatching() {
 	DBGLOG("user", "loadFilesForPatching %lu", binaryModSize);
+	const bool strictTahoe = getKernelVersion() == KernelVersion::Tahoe;
+	bool complete = true;
 
 	for (size_t i = 0; i < binaryModSize; i++) {
 		bool hasPatches = false;
@@ -834,8 +1042,23 @@ bool UserPatcher::loadFilesForPatching() {
 			continue;
 		}
 
-		size_t fileSize;
-		auto buf = FileIO::readFileToBuffer(binaryMod[i]->path, fileSize);
+		size_t fileSize {0};
+		uint64_t cacheTextStart {0};
+		uint64_t cacheBase {0};
+		uint8_t cacheUUID[16] {};
+		auto buf = strictTahoe ? TahoeCache::readText(BaseDeviceInfo::get().cpuHasAvx2 ?
+			venturaSharedCacheHaswell : venturaSharedCacheLegacy, binaryMod[i]->path, fileSize, cacheTextStart, &cacheBase, cacheUUID) :
+			FileIO::readFileToBuffer(binaryMod[i]->path, fileSize);
+		if (strictTahoe && buf) {
+			if (tahoeCacheBase && (tahoeCacheBase != cacheBase || memcmp(tahoeCacheUUID, cacheUUID, 16))) {
+				Buffer::deleter(buf);
+				return false;
+			}
+			tahoeCacheBase = cacheBase;
+			memcpy(tahoeCacheUUID, cacheUUID, 16);
+			binaryMod[i]->startTEXT = cacheTextStart;
+			binaryMod[i]->endTEXT = cacheTextStart+fileSize;
+		}
 		if (buf) {
 			vm_address_t vmsegment {0};
 			vm_address_t vmsection {0};
@@ -856,13 +1079,18 @@ bool UserPatcher::loadFilesForPatching() {
 					SYSLOG("user", "skipping patch %s for %lu with invalid segment id %u", binaryMod[i]->path, p, patch.segment);
 					continue;
 				}
+				if (strictTahoe && patch.segment > FileSegment::SegmentsTextEnd) {
+					SYSLOG("user", "Tahoe bounded cache reader refuses non-text patch sources");
+					complete = false;
+					continue;
+				}
 
 				MachInfo::findSectionBounds(buf, fileSize, vmsegment, vmsection, sectionptr, size,
 											fileSegments[patch.segment], fileSections[patch.segment], patch.cpu);
 
 				DBGLOG("user", "findSectionBounds returned vmsegment %llX vmsection %llX sectionptr %p size %lu", (uint64_t)vmsegment, (uint64_t)vmsection, sectionptr, size);
 
-				if (size) {
+				if (size && patch.size && size >= patch.size) {
 					uint8_t *start = reinterpret_cast<uint8_t *>(sectionptr);
 					uint8_t *end = start + size - patch.size;
 					size_t skip = patch.skip;
@@ -870,8 +1098,13 @@ bool UserPatcher::loadFilesForPatching() {
 
 					DBGLOG("user", "this patch will start from %lu entry and will replace %lu findings", skip, count);
 
-					while (start < end && count) {
+					while ((start < end || (strictTahoe && start == end)) && (count || strictTahoe)) {
 						if (!memcmp(start, patch.find, patch.size)) {
+							if (strictTahoe && !count) {
+								SYSLOG("user", "Tahoe patch source is ambiguous for %s patch %lu", binaryMod[i]->path, p);
+								complete = false;
+								break;
+							}
 							DBGLOG("user", "found entry of %X %X patch", patch.find[0], patch.find[1]);
 
 							if (skip == 0) {
@@ -886,7 +1119,8 @@ bool UserPatcher::loadFilesForPatching() {
 								// We need binary entry, i.e. the page our patch belong to
 								LookupStorage *entry = nullptr;
 								for (size_t e = 0, esz = lookupStorage.size(); e < esz && !entry; e++) {
-									if (lookupStorage[e]->pageOff == static_cast<vm_address_t>(pageOff))
+									if (lookupStorage[e]->pageOff == static_cast<vm_address_t>(pageOff) &&
+									    (!strictTahoe || lookupStorage[e]->mod == binaryMod[i]))
 										entry = lookupStorage[e];
 								}
 
@@ -961,15 +1195,23 @@ bool UserPatcher::loadFilesForPatching() {
 						}
 						start++;
 					}
+					if (strictTahoe && count) {
+						SYSLOG("user", "Tahoe patch source incomplete for %s patch %lu", binaryMod[i]->path, p);
+						complete = false;
+					}
 				} else {
 					SYSLOG("user", "failed to obtain a corresponding section");
+					if (strictTahoe) complete = false;
 				}
 			}
 
 			Buffer::deleter(buf);
+		} else if (strictTahoe) {
+			SYSLOG("user", "Tahoe patch source unavailable: %s", binaryMod[i]->path);
+			complete = false;
 		}
 	}
-	return true;
+	return complete;
 }
 
 bool UserPatcher::loadLookups() {
@@ -1055,13 +1297,24 @@ vm_prot_t UserPatcher::getPageProtection(vm_map_t map, vm_map_address_t addr) {
 }
 
 bool UserPatcher::hookMemoryAccess() {
-	// 10.12 and newer
-	KernelPatcher::RouteRequest rangeRoute {"_cs_validate_range", codeSignValidateRangeWrapper, orgCodeSignValidateRangeWrapper};
-	if (!patcher->routeMultipleLong(KernelPatcher::KernelID, &rangeRoute, 1)) {
-		KernelPatcher::RouteRequest pageRoute {"_cs_validate_page", codeSignValidatePageWrapper, orgCodeSignValidatePageWrapper};
-		if (!patcher->routeMultipleLong(KernelPatcher::KernelID, &pageRoute, 1)) {
-			SYSLOG("user", "failed to resolve _cs_validate function");
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		orgCsAllowInvalid = reinterpret_cast<t_csAllowInvalid>(patcher->solveSymbol(KernelPatcher::KernelID, "_cs_allow_invalid"));
+		if (patcher->getError() != KernelPatcher::Error::NoError || !orgCsAllowInvalid) {
+			patcher->clearError();
+			SYSLOG("user", "Tahoe native code-modification policy is unavailable");
 			return false;
+		}
+	}
+	// Tahoe accepts only LocalOnly patches and uses native per-process policy.
+	// It must never install the legacy global code-signature page patch hooks.
+	if (getKernelVersion() != KernelVersion::Tahoe) {
+		KernelPatcher::RouteRequest rangeRoute {"_cs_validate_range", codeSignValidateRangeWrapper, orgCodeSignValidateRangeWrapper};
+		if (!patcher->routeMultipleLong(KernelPatcher::KernelID, &rangeRoute, 1)) {
+			KernelPatcher::RouteRequest pageRoute {"_cs_validate_page", codeSignValidatePageWrapper, orgCodeSignValidatePageWrapper};
+			if (!patcher->routeMultipleLong(KernelPatcher::KernelID, &pageRoute, 1)) {
+				SYSLOG("user", "failed to resolve _cs_validate function");
+				return false;
+			}
 		}
 	}
 
@@ -1112,6 +1365,15 @@ bool UserPatcher::hookMemoryAccess() {
 		SYSLOG("user", "failed to resolve _vm_map_write_user");
 		patcher->clearError();
 		return false;
+	}
+	if (getKernelVersion() == KernelVersion::Tahoe) {
+		orgProcExecutableVnode = reinterpret_cast<t_procExecutableVnode>(patcher->solveSymbol(KernelPatcher::KernelID, "_proc_getexecutablevnode"));
+		if (patcher->getError() != KernelPatcher::Error::NoError || !orgProcExecutableVnode) {
+			patcher->clearError();
+			return false;
+		}
+		KernelPatcher::RouteRequest checkRoute {"_shared_region_check_np", sharedRegionCheckTahoe, orgSharedRegionCheckTahoe};
+		return patcher->routeMultipleLong(KernelPatcher::KernelID, &checkRoute, 1);
 	}
 
 	// On 10.12.1 b4 Apple decided not to let current_map point to the current process

@@ -244,8 +244,13 @@ bool Configuration::getBootArguments() {
 
 	betaForAll = checkKernelArgument(bootargBetaAll);
 	debugForAll = checkKernelArgument(bootargDebugAll);
+	bool tahoeUser = false;
+#if defined(__x86_64__)
+	tahoeUser = getKernelVersion() == KernelVersion::Tahoe && checkKernelArgument(bootargTahoeUser);
+#endif
 	isUserDisabled = checkKernelArgument(bootargUserOff) ||
-		getKernelVersion() <= KernelVersion::SnowLeopard || getKernelVersion() >= KernelVersion::BigSur;
+		getKernelVersion() <= KernelVersion::SnowLeopard ||
+		(getKernelVersion() >= KernelVersion::BigSur && !tahoeUser);
 
 	lilu_get_boot_args(bootargDelay, &ADDPR(debugPrintDelay), sizeof(ADDPR(debugPrintDelay)));
 

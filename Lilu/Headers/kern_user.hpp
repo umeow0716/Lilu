@@ -262,6 +262,18 @@ private:
 	using t_vmMapCheckProtection = boolean_t (*)(vm_map_t, vm_map_offset_t, vm_map_offset_t, vm_prot_t);
 	using t_vmMapReadUser = kern_return_t (*)(vm_map_t, vm_map_address_t, const void *, vm_size_t);
 	using t_vmMapWriteUser = kern_return_t (*)(vm_map_t, const void *, vm_map_address_t, vm_size_t);
+	using t_csAllowInvalid = int (*)(proc_t);
+	t_csAllowInvalid orgCsAllowInvalid {nullptr};
+	using t_procExecutableVnode = vnode_t (*)(proc_t);
+	t_procExecutableVnode orgProcExecutableVnode {nullptr};
+	mach_vm_address_t orgSharedRegionCheckTahoe {};
+	uint64_t tahoeCacheBase {0};
+	uint8_t tahoeCacheUUID[16] {};
+	IOLock *tahoeCacheLock {nullptr};
+	bool tahoeCacheAttempted {false};
+	bool tahoeCacheLoaded {false};
+	struct TahoeCheckArguments { uint64_t startAddress; };
+	static int sharedRegionCheckTahoe(proc_t process, TahoeCheckArguments *args, int *retval);
 
 	/**
 	 *  Original kernel function trampolines
@@ -404,6 +416,7 @@ private:
 	 *  @param restore true to rollback the changes
 	 */
 	void patchSharedCache(vm_map_t map, uint32_t slide, cpu_type_t cpu, bool applyChanges=true);
+	bool patchSharedCacheTahoe(vm_map_t map, uint32_t slide);
 
 	/**
 	 *  Structure holding userspace lookup patches

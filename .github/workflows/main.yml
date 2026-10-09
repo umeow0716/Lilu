@@ -14,11 +14,21 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     env:
       JOB_TYPE: BUILD
     steps:
       - uses: actions/checkout@v4
+      - name: Record Tahoe Intel toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+      - name: Exercise bounded Tahoe cache reader
+        run: |
+          clang++ -std=c++14 -Wall -Wextra -Werror -fsanitize=address,undefined Tests/tahoe_cache.cpp -o "$RUNNER_TEMP/tahoe-cache-test"
+          "$RUNNER_TEMP/tahoe-cache-test"
       - uses: actions/checkout@v4
         with:
           repository: acidanthera/MacKernelSDK
@@ -46,7 +56,7 @@ jobs:
 
   analyze-clang:
     name: Analyze Clang
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     env:
       JOB_TYPE: ANALYZE
     steps:
@@ -64,7 +74,7 @@ jobs:
 
   analyze-coverity:
     name: Analyze Coverity
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     env:
       JOB_TYPE: COVERITY
     if: github.repository_owner == 'acidanthera' && github.event_name != 'pull_request'
