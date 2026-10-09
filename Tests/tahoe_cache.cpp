@@ -9,6 +9,7 @@
 #include <string>
 #include <algorithm>
 #include <sys/types.h>
+#include "../Lilu/PrivateHeaders/kern_patch_span.hpp"
 #define LILU_CACHE_HOST_TEST
 struct Node { std::vector<uint8_t> bytes; };
 using vnode_t = Node *;
@@ -92,6 +93,28 @@ static bool run() {
 	Buffer::deleter(result); return true;
 }
 int main() {
+	const uint8_t anchor[] = {1, 2, 3, 4, 5, 6};
+	const uint8_t first[] = {1, 9, 3, 4, 5, 6};
+	const uint8_t second[] = {1, 2, 3, 4, 8, 6};
+	size_t offset = 99, length = 99;
+	assert(PatchSpan::changed(anchor, first, sizeof(anchor), offset, length) && offset == 1 && length == 1);
+	assert(PatchSpan::changed(anchor, second, sizeof(anchor), offset, length) && offset == 4 && length == 1);
+	assert(!PatchSpan::changed(anchor, anchor, sizeof(anchor), offset, length));
+	assert(!PatchSpan::changed(nullptr, second, sizeof(anchor), offset, length));
+	const uint8_t ends[] = {9, 2, 3, 4, 5, 8};
+	assert(PatchSpan::changed(anchor, ends, sizeof(anchor), offset, length) && offset == 0 && length == sizeof(anchor));
+	uint8_t target[sizeof(anchor)];
+	memcpy(target, anchor, sizeof(anchor));
+	size_t firstOffset, firstSize, secondOffset, secondSize;
+	assert(PatchSpan::changed(anchor, first, sizeof(anchor), firstOffset, firstSize));
+	assert(PatchSpan::changed(anchor, second, sizeof(anchor), secondOffset, secondSize));
+	assert(firstOffset+firstSize <= secondOffset);
+	memcpy(target+firstOffset, first+firstOffset, firstSize);
+	memcpy(target+secondOffset, second+secondOffset, secondSize);
+	assert(target[1] == 9 && target[4] == 8 && target[2] == 3);
+	memcpy(target+secondOffset, anchor+secondOffset, secondSize);
+	memcpy(target+firstOffset, anchor+firstOffset, firstSize);
+	assert(!memcmp(target, anchor, sizeof(anchor)));
 	fixture(); assert(run());
 	fixture(); files[cachePath].bytes.resize(32); assert(!run());
 	fixture(); put(0x1c4, uint32_t(32769)); assert(!run());

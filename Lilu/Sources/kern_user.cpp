@@ -13,6 +13,7 @@
 #include <Headers/kern_devinfo.hpp>
 #include <PrivateHeaders/kern_config.hpp>
 #include <PrivateHeaders/kern_cache.hpp>
+#include <PrivateHeaders/kern_patch_span.hpp>
 
 #include <mach/vm_map.h>
 #include <mach-o/fat.h>
@@ -398,7 +399,7 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 		SYSLOG("user", "Tahoe local patch requires the admitted process's own execution context");
 		return false;
 	}
-	struct Action { uint64_t address; const BinaryModPatch *patch; vm_prot_t protection; };
+	struct Action { uint64_t address; const BinaryModPatch *patch; vm_prot_t protection; size_t offset; size_t size; };
 	constexpr size_t MaxActions = 128;
 	auto actions = Buffer::create<Action>(MaxActions);
 	auto scratch = Buffer::create<uint8_t>(PAGE_SIZE);
@@ -426,8 +427,10 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 		for (size_t j = 0; valid && j < storage->refs.size(); j++) {
 			auto ref = storage->refs[j];
 			auto &patch = storage->mod->patches[ref->i];
+			size_t changedOffset = 0, changedSize = 0;
 			if (patch.cpu != CPU_TYPE_X86_64 || !(patch.flags & LocalOnly) ||
-			    !patch.find || !patch.replace || !patch.size || patch.size > PAGE_SIZE) { valid = false; break; }
+			    !patch.find || !patch.replace || !patch.size || patch.size > PAGE_SIZE ||
+			    !PatchSpan::changed(patch.find, patch.replace, patch.size, changedOffset, changedSize)) { valid = false; break; }
 			for (size_t k = 0; valid && k < ref->segOffs.size(); k++) {
 				auto start = storage->mod->startTEXT;
 				auto end = storage->mod->endTEXT;
@@ -436,8 +439,9 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 				    patch.size > end-start-uint64_t(offset) || end > UINT64_MAX-slide || count == MaxActions) { valid = false; break; }
 				auto address = start+uint64_t(offset)+slide;
 				if (patch.size > PAGE_SIZE-(address & (PAGE_SIZE-1))) { valid = false; break; }
+				auto writeAddress = address+changedOffset;
 				for (size_t n = 0; n < count; n++) {
-					if (address < actions[n].address+actions[n].patch->size && actions[n].address < address+patch.size) valid = false;
+					if (writeAddress < actions[n].address+actions[n].size && actions[n].address < writeAddress+changedSize) valid = false;
 				}
 				if (!valid) break;
 				auto protection = getPageProtection(map, address & -PAGE_SIZE);
@@ -448,7 +452,7 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 					valid = false; break;
 				}
 				if (!count) SYSLOG("user", "Tahoe exact local patch leaf admitted protection=%X read=%X matches=%d", protection, readResult, matches);
-				actions[count++] = {address, &patch, protection};
+				actions[count++] = {writeAddress, &patch, protection, changedOffset, changedSize};
 			}
 		}
 	}
@@ -465,11 +469,11 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 			valid = false; break;
 		}
 		touched = i+1;
-		auto write = orgVmMapWriteUser(map, action.patch->replace, action.address, action.patch->size);
-		auto read = orgVmMapReadUser(map, action.address, scratch, action.patch->size);
+		auto write = orgVmMapWriteUser(map, action.patch->replace+action.offset, action.address, action.size);
+		auto read = orgVmMapReadUser(map, action.address, scratch, action.size);
 		auto restore = vmProtect(map, page, PAGE_SIZE, FALSE, action.protection);
-		valid = !write && !read && !restore && !memcmp(scratch, action.patch->replace, action.patch->size);
-		if (!valid) SYSLOG("user", "Tahoe local patch write verification failed site=%lu write=%X read=%X restore=%X matches=%d", i, write, read, restore, !read && !memcmp(scratch, action.patch->replace, action.patch->size));
+		valid = !write && !read && !restore && !memcmp(scratch, action.patch->replace+action.offset, action.size);
+		if (!valid) SYSLOG("user", "Tahoe local patch write verification failed site=%lu write=%X read=%X restore=%X matches=%d", i, write, read, restore, !read && !memcmp(scratch, action.patch->replace+action.offset, action.size));
 	}
 	if (!valid) {
 		bool rollback = true;
@@ -477,10 +481,10 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 			auto &action = actions[--touched];
 			auto page = action.address & -PAGE_SIZE;
 			if (vmProtect(map, page, PAGE_SIZE, FALSE, action.protection|VM_PROT_WRITE|VM_PROT_COPY)) { rollback = false; continue; }
-			auto write = orgVmMapWriteUser(map, action.patch->find, action.address, action.patch->size);
-			auto read = orgVmMapReadUser(map, action.address, scratch, action.patch->size);
+			auto write = orgVmMapWriteUser(map, action.patch->find+action.offset, action.address, action.size);
+			auto read = orgVmMapReadUser(map, action.address, scratch, action.size);
 			auto restore = vmProtect(map, page, PAGE_SIZE, FALSE, action.protection);
-			if (write || read || restore || memcmp(scratch, action.patch->find, action.patch->size)) rollback = false;
+			if (write || read || restore || memcmp(scratch, action.patch->find+action.offset, action.size)) rollback = false;
 		}
 		SYSLOG("user", "Tahoe local patch transaction failed rollback=%d", rollback);
 	} else {
