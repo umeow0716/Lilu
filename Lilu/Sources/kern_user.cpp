@@ -441,9 +441,10 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 				}
 				if (!valid) break;
 				auto protection = getPageProtection(map, address & -PAGE_SIZE);
-				if (protection != (VM_PROT_READ|VM_PROT_EXECUTE) ||
-				    orgVmMapReadUser(map, address, scratch, patch.size) || memcmp(scratch, patch.find, patch.size)) {
-					SYSLOG("user", "Tahoe local patch target preflight failed at %llX", address);
+				auto readResult = orgVmMapReadUser(map, address, scratch, patch.size);
+				bool matches = !readResult && !memcmp(scratch, patch.find, patch.size);
+				if (protection != (VM_PROT_READ|VM_PROT_EXECUTE) || !matches) {
+					SYSLOG("user", "Tahoe local patch target preflight failed at %llX protection=%X read=%X matches=%d site=%lu size=%lu", address, protection, readResult, matches, ref->i, patch.size);
 					valid = false; break;
 				}
 				actions[count++] = {address, &patch, protection};
