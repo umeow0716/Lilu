@@ -453,17 +453,23 @@ bool UserPatcher::patchSharedCacheTahoe(vm_map_t map, uint32_t slide) {
 		}
 	}
 	valid = valid && count && count == expected;
+	SYSLOG("user", "Tahoe local patch prevalidation valid=%d sites=%lu expected=%lu", valid, count, expected);
 	size_t touched = 0;
 	for (size_t i = 0; valid && i < count; i++) {
 		auto &action = actions[i];
 		auto page = action.address & -PAGE_SIZE;
 		// VM_PROT_COPY requests private COW; never write global cache pages.
-		if (vmProtect(map, page, PAGE_SIZE, FALSE, action.protection|VM_PROT_WRITE|VM_PROT_COPY)) { valid = false; break; }
+		auto protect = vmProtect(map, page, PAGE_SIZE, FALSE, action.protection|VM_PROT_WRITE|VM_PROT_COPY);
+		if (protect) {
+			SYSLOG("user", "Tahoe local patch COW protect failed site=%lu address=%llX result=%X", i, action.address, protect);
+			valid = false; break;
+		}
 		touched = i+1;
 		auto write = orgVmMapWriteUser(map, action.patch->replace, action.address, action.patch->size);
 		auto read = orgVmMapReadUser(map, action.address, scratch, action.patch->size);
 		auto restore = vmProtect(map, page, PAGE_SIZE, FALSE, action.protection);
 		valid = !write && !read && !restore && !memcmp(scratch, action.patch->replace, action.patch->size);
+		if (!valid) SYSLOG("user", "Tahoe local patch write verification failed site=%lu write=%X read=%X restore=%X matches=%d", i, write, read, restore, !read && !memcmp(scratch, action.patch->replace, action.patch->size));
 	}
 	if (!valid) {
 		bool rollback = true;
